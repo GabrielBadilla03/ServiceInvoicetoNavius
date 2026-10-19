@@ -8,6 +8,7 @@ using System.IO;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ServiceInvoicetoNavius
@@ -1093,8 +1094,8 @@ namespace ServiceInvoicetoNavius
         // Si la llave no existe en el .config, se usa el valor por defecto de aquí.
         public sealed class OpcionesTraslado
         {
-            // ARREGLO 8: máximo de facturas que se trasladan por ciclo (0 = sin límite).
-            public int MaxFacturasPorCiclo { get; set; } = 50;
+            // ARREGLO 8: máximo de facturas que se trasladan por ciclo (Service1 lo limita a 1..100).
+            public int MaxFacturasPorCiclo { get; set; } = 10;
 
             // ARREGLO 2: validar que el total del encabezado cuadre con la suma de líneas.
             // Se puede apagar desde el .config sin recompilar si diera falsos positivos.
@@ -1106,6 +1107,15 @@ namespace ServiceInvoicetoNavius
             // Ciclos que se espera a que la integración termine de cargar una factura en ATP
             // antes de marcarla con error (con IntervalMs=240000, 5 ciclos = 20 minutos).
             public int MaxCiclosEspera { get; set; } = 5;
+
+            // REVISION v5: ciclos que se deja descansar una factura que falló por un motivo
+            // que no se corrige solo (repetida, copia distinta en 11g, datos inconsistentes).
+            // Con IntervalMs=240000, 15 ciclos = 1 hora.
+            public int CiclosReintentoRevision { get; set; } = 15;
+
+            // REVISION v5: tiempo máximo de GuardarFacturas en segundos (0 = sin límite).
+            // Ojo: si se corta, el paquete revierte TODO el lote (consecutivos ya gastados).
+            public int TimeoutGuardarFacturasSeg { get; set; } = 600;
         }
 
         private readonly OpcionesTraslado _opciones;
@@ -1120,6 +1130,15 @@ namespace ServiceInvoicetoNavius
 
         private readonly ConcurrentDictionary<string, int> _ciclosEspera =
             new ConcurrentDictionary<string, int>();
+
+        // REVISION v5: facturas que no se pudieron trasladar y siguen en INDTRASLADO='N'.
+        // Valor = número de ciclo a partir del cual se puede volver a intentar.
+        // Sin esto, como ATP las devuelve siempre primero (ORDER BY ruta), unas pocas
+        // facturas trabadas ocupaban TODO el lote y el servicio dejaba de trasladar.
+        private readonly ConcurrentDictionary<string, int> _enRevision =
+            new ConcurrentDictionary<string, int>();
+
+        private int _cicloActual = 0;
 
         private readonly ConcurrentDictionary<string, Dictionary<string, ColumnaDestinoInfo>> _cacheColumnas =
             new ConcurrentDictionary<string, Dictionary<string, ColumnaDestinoInfo>>(StringComparer.OrdinalIgnoreCase);
@@ -1231,6 +1250,16 @@ namespace ServiceInvoicetoNavius
 
             var dt = new DataTable();
 
+            // REVISION v5: la ventana que se lee de ATP = lote + facturas en revisión.
+            // Así, aunque las trabadas salgan primero en el ORDER BY, siempre quedan
+            // al menos "maxCiclo" facturas nuevas dentro de la ventana.
+            int ciclo = Interlocked.Increment(ref _cicloActual);
+            int maxCiclo = Math.Max(1, Math.Min(500, _opciones.MaxFacturasPorCiclo <= 0 ? 10 : _opciones.MaxFacturasPorCiclo));
+            int ventana = Math.Min(500, maxCiclo + _enRevision.Count);
+
+            if (maxCiclo + _enRevision.Count > 500)
+                _log($"ADVERTENCIA: {_enRevision.Count} facturas en revisión. Pueden ocupar la ventana de lectura; revisarlas en el log.");
+
             using (var conSrc = OpenSrc())
             using (var cmd = conSrc.CreateCommand())
             {
@@ -1238,14 +1267,19 @@ namespace ServiceInvoicetoNavius
                 cmd.InitialLOBFetchSize = -1;
                 cmd.CommandText = selectBase;
                 cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
-                cmd.Parameters.Add(":pMax", OracleDbType.Int32, Math.Max(1, Math.Min(500, _opciones.MaxFacturasPorCiclo <= 0 ? 10 : _opciones.MaxFacturasPorCiclo)), ParameterDirection.Input);
+                cmd.Parameters.Add(":pMax", OracleDbType.Int32, ventana, ParameterDirection.Input);
 
                 using (var da = new OracleDataAdapter(cmd))
                     da.Fill(dt);
             }
 
+            // REVISION v5: los números repetidos en ATP los excluye el SELECT (HAVING COUNT(*) = 1),
+            // así que nunca llegan al log. Se cuentan aparte para que se vean.
+            RegistrarRepetidosExcluidos();
+
             if (dt.Rows.Count == 0)
             {
+                _enRevision.Clear();
                 _log("No hay registros pendientes INDTRASLADO='N'.");
                 return 0;
             }
@@ -1273,18 +1307,33 @@ namespace ServiceInvoicetoNavius
                 });
             }
 
-            // ARREGLO 8: procesar por lotes. Las facturas que ya están "en espera" van al final
-            // para que no ocupen el lote mientras haya facturas nuevas por trasladar.
-            int totalPendientes = grupos.Count;
+            // ARREGLO 8 + REVISION v5: armar el lote del ciclo.
+            //  1. Si la lectura trajo menos que la ventana, se vio TODO lo pendiente:
+            //     se olvidan las facturas en revisión que ya no están pendientes.
+            //  2. Las que están en revisión y todavía no les toca reintento se saltan.
+            //  3. Primero las nuevas, después las en revisión a las que ya les toca
+            //     (OrderBy es estable: respeta el ORDER BY del SELECT).
+            int totalLeidas = grupos.Count;
+
+            if (totalLeidas < ventana)
+            {
+                var vistas = new HashSet<string>(grupos.Select(x => x.NumFacturaOracle));
+                foreach (var num in _enRevision.Keys.Where(k => !vistas.Contains(k)).ToList())
+                {
+                    int ignorar;
+                    _enRevision.TryRemove(num, out ignorar);
+                }
+            }
+
+            int enDescanso = grupos.Count(x => EnDescanso(x.NumFacturaOracle, ciclo));
 
             grupos = grupos
-                .OrderBy(x => _ciclosEspera.ContainsKey(x.NumFacturaOracle) ? 1 : 0)   // OrderBy es estable: respeta el ORDER BY del SELECT
+                .Where(x => !EnDescanso(x.NumFacturaOracle, ciclo))
+                .OrderBy(x => _enRevision.ContainsKey(x.NumFacturaOracle) ? 1 : 0)
+                .Take(maxCiclo)
                 .ToList();
 
-            if (_opciones.MaxFacturasPorCiclo > 0 && grupos.Count > _opciones.MaxFacturasPorCiclo)
-                grupos = grupos.Take(_opciones.MaxFacturasPorCiclo).ToList();
-
-            _log($"Facturas pendientes en ATP: {totalPendientes} | Se procesan en este ciclo: {grupos.Count}");
+            _log($"Ciclo {ciclo} | Leídas de ATP: {totalLeidas} | En revisión: {_enRevision.Count} (esperando reintento: {enDescanso}) | Se procesan en este ciclo: {grupos.Count}");
 
             int ok = 0, pendientes = 0, errores = 0;
             var lockObj = new object();
@@ -1311,6 +1360,17 @@ namespace ServiceInvoicetoNavius
                     _log($"ERROR NO CONTROLADO trasladando FacturaOracle={g.NumFacturaOracle} | {ex.Message}");
                     r = ResultadoTraslado.Error;
                 }
+
+                // REVISION v5: recordar las que no avanzaron, para que no tapen el lote.
+                //  Pendiente (sin detalle todavía, montos, marca en ATP): se reintenta el siguiente ciclo.
+                //  Error (requiere revisión): descansa CiclosReintentoRevision ciclos.
+                int ignorar;
+                if (r == ResultadoTraslado.Ok)
+                    _enRevision.TryRemove(g.NumFacturaOracle, out ignorar);
+                else if (r == ResultadoTraslado.Pendiente)
+                    _enRevision[g.NumFacturaOracle] = ciclo + 1;
+                else
+                    _enRevision[g.NumFacturaOracle] = ciclo + Math.Max(1, _opciones.CiclosReintentoRevision);
 
                 lock (lockObj)
                 {
@@ -1352,6 +1412,11 @@ namespace ServiceInvoicetoNavius
                 return ResultadoTraslado.Error;
             }
 
+            // REVISION v5: el detalle de ATP se lee ANTES de revisar el staging, porque
+            // hace falta para conciliar una factura que ya está en 11g (ver abajo).
+            DataTable dtDet = LeerAtp(SqlDetalleAtp, numFacturaOracle, tipoDoc);
+            DataTable dtImp = LeerAtp(SqlImpuestoAtp, numFacturaOracle, null);
+
             // ---------------------------------------------------------------
             // ¿Ya existe en el staging de 11g?
             // ---------------------------------------------------------------
@@ -1366,13 +1431,23 @@ namespace ServiceInvoicetoNavius
                     int detEnDestino = ContarEnDestino(con, "XXORA_VENDOCDETFED", numFacturaOracle);
 
                     // PROTECCION: un detalle existente NO demuestra que la factura este completa.
-                    // Hasta disponer de comparacion exhaustiva y clave unica, se bloquea
-                    // cualquier reconciliacion automatica de una cabecera preexistente.
+                    // REVISION v5: se concilia solo si la copia en 11g es IGUAL a ATP:
+                    // 1 encabezado, misma cantidad de líneas de detalle e impuesto y misma
+                    // suma de MONTOTOTALLINEA. Es el caso típico de "se trasladó bien pero
+                    // falló marcar 'S' en ATP". Cualquier diferencia queda para revisión manual.
                     if (mismaFactura && detEnDestino > 0)
                     {
-                        string advertencia = "Cabecera preexistente: verificar conjunto completo de detalle/impuestos antes de marcar ATP como trasladada";
+                        string diferencia = null;
+                        if (cabEnDestino == 1 && CopiaIgualEnDestino(con, numFacturaOracle, dtDet, dtImp, out diferencia))
+                        {
+                            _log($"CONCILIADA: la copia en 11g es igual a ATP, se marca 'S' | {ctx}");
+                            return MarcarTrasladada(numFacturaOracle) ? ResultadoTraslado.Ok : ResultadoTraslado.Pendiente;
+                        }
+
+                        string advertencia = "Cabecera preexistente con copia distinta a ATP: " +
+                            (cabEnDestino == 1 ? diferencia : $"{cabEnDestino} encabezados en 11g");
                         _log($"REVISION MANUAL | {ctx} | {advertencia}");
-                        return ResultadoTraslado.Pendiente;
+                        return ResultadoTraslado.Error;
                     }
 
                     string err = mismaFactura
@@ -1388,9 +1463,6 @@ namespace ServiceInvoicetoNavius
             // ---------------------------------------------------------------
             // ARREGLO 2: validar antes de trasladar
             // ---------------------------------------------------------------
-            DataTable dtDet = LeerAtp(SqlDetalleAtp, numFacturaOracle, tipoDoc);
-            DataTable dtImp = LeerAtp(SqlImpuestoAtp, numFacturaOracle, null);
-
             if (dtDet.Rows.Count == 0)
                 return EsperarOMarcarError(factura, "Encabezado en ATP sin líneas de detalle", ctx);
 
@@ -1401,8 +1473,10 @@ namespace ServiceInvoicetoNavius
                 string linea = fila["LINEADETALLE"] == DBNull.Value ? null : Convert.ToString(fila["LINEADETALLE"], CultureInfo.InvariantCulture).Trim();
                 if (string.IsNullOrEmpty(linea) || !clavesDetalle.Add(linea))
                 {
-                    _log($"DETALLE INCONSISTENTE | {ctx} | LINEADETALLE nula o duplicada={linea}");
-                    return ResultadoTraslado.Pendiente;
+                    // REVISION v5: Error (y no Pendiente) para que descanse y no ocupe el lote:
+                    // es un dato de ATP que no se corrige solo.
+                    _log($"DETALLE INCONSISTENTE | {ctx} | LINEADETALLE nula o duplicada={linea} | Próximo reintento en {_opciones.CiclosReintentoRevision} ciclos");
+                    return ResultadoTraslado.Error;
                 }
             }
             var clavesImpuesto = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1414,8 +1488,8 @@ namespace ServiceInvoicetoNavius
                 if (string.IsNullOrEmpty(linea) || !clavesDetalle.Contains(linea) ||
                     !clavesImpuesto.Add(linea + "|" + codigo + "|" + tarifa))
                 {
-                    _log($"IMPUESTO INCONSISTENTE | {ctx} | LINEADETALLE={linea} CODIGO={codigo} CODIGOTARIFA={tarifa}");
-                    return ResultadoTraslado.Pendiente;
+                    _log($"IMPUESTO INCONSISTENTE | {ctx} | LINEADETALLE={linea} CODIGO={codigo} CODIGOTARIFA={tarifa} | Próximo reintento en {_opciones.CiclosReintentoRevision} ciclos");
+                    return ResultadoTraslado.Error;
                 }
             }
 
@@ -1442,16 +1516,17 @@ namespace ServiceInvoicetoNavius
             {
                 try
                 {
-                    // ARREGLO 7: si en staging quedaron líneas de esta factura SIN encabezado
-                    // (p. ej. alguien borró el encabezado a mano para reprocesar), se borran
-                    // dentro de esta misma transacción antes de insertar, para no duplicarlas.
-                    // Sin encabezado, GuardarFacturas nunca las procesó.
-                    // No borrar lineas huérfanas de forma automática: la identidad
-                    // NUM_FACTURA_ORACLE puede no ser única entre documentos.
+                    // ARREGLO 7 (decisión del equipo): si en staging quedaron líneas de esta
+                    // factura SIN encabezado, NO se borran automáticamente; se deja para
+                    // conciliación manual (consulta 6 de consultas_previa_instalacion.sql).
                     int detHuerfano = ContarEnDestino(con, "XXORA_VENDOCDETFED", numFacturaOracle);
                     int impHuerfano = ContarEnDestino(con, "XXORA_VENDOCDETIMPFED", numFacturaOracle);
                     if (detHuerfano + impHuerfano > 0)
-                        throw new InvalidOperationException($"Existen lineas sin cabecera, requiere conciliacion manual | detalle={detHuerfano}, impuesto={impHuerfano}");
+                    {
+                        tx.Rollback();
+                        _log($"LINEAS HUERFANAS EN 11g, requiere conciliación manual | {ctx} | Detalle={detHuerfano} | Impuesto={impHuerfano} | Próximo reintento en {_opciones.CiclosReintentoRevision} ciclos");
+                        return ResultadoTraslado.Error;
+                    }
 
                     // El encabezado va de último: GuardarFacturas nunca lo ve sin su detalle.
                     InsertarArrayBind(con, dtDet, "XXORA_VENDOCDETFED", $"Detalle | {ctx}");
@@ -1479,8 +1554,7 @@ namespace ServiceInvoicetoNavius
                     try { tx.Rollback(); } catch { /* si la conexión cayó, Oracle ya hizo rollback */ }
 
                     string err = $"Traslado revertido (rollback) | {ex.Message}";
-                    _log($"ERROR | {ctx} | {err}");
-                    _log($"ERROR TRANSITORIO SIN MARCAR ATP E | {ctx} | {err}");
+                    _log($"ERROR | {ctx} | {err} | ATP queda en 'N' | Próximo reintento en {_opciones.CiclosReintentoRevision} ciclos");
                     return ResultadoTraslado.Error;
                 }
             }
@@ -1490,8 +1564,92 @@ namespace ServiceInvoicetoNavius
 
             _log($"Trasladada OK | {ctx} | LineasDetalle={dtDet.Rows.Count} | LineasImpuesto={dtImp.Rows.Count}");
 
-            // Si este UPDATE falla, el siguiente ciclo la detecta como "YA TRASLADADA".
+            // Si este UPDATE falla, la factura ya está completa en 11g: el siguiente ciclo
+            // la encuentra en staging y la concilia (CONCILIADA) si la copia es igual a ATP.
             return MarcarTrasladada(numFacturaOracle) ? ResultadoTraslado.Ok : ResultadoTraslado.Pendiente;
+        }
+
+        // REVISION v5: compara la copia que ya está en 11g contra lo que hay en ATP.
+        private bool CopiaIgualEnDestino(OracleConnection con, string numFacturaOracle,
+                                         DataTable dtDet, DataTable dtImp, out string diferencia)
+        {
+            diferencia = null;
+
+            int detDestino;
+            decimal sumaDestino;
+
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.CommandText = @"
+                    SELECT COUNT(1) AS CANT, NVL(SUM(MONTOTOTALLINEA), 0) AS SUMA
+                      FROM XXORA_VENDOCDETFED
+                     WHERE NUM_FACTURA_ORACLE = :p
+                       AND CIA = :pCIA";
+                cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+
+                using (var rd = cmd.ExecuteReader())
+                {
+                    rd.Read();
+                    detDestino = Convert.ToInt32(rd["CANT"]);
+                    sumaDestino = ToDec(rd["SUMA"]);
+                }
+            }
+
+            int impDestino = ContarEnDestino(con, "XXORA_VENDOCDETIMPFED", numFacturaOracle);
+            decimal sumaAtp = dtDet.Rows.Cast<DataRow>().Sum(r => ToDec(r["MONTOTOTALLINEA"]));
+
+            if (detDestino != dtDet.Rows.Count)
+                diferencia = $"líneas de detalle 11g={detDestino} vs ATP={dtDet.Rows.Count}";
+            else if (impDestino != dtImp.Rows.Count)
+                diferencia = $"líneas de impuesto 11g={impDestino} vs ATP={dtImp.Rows.Count}";
+            else if (Math.Abs(sumaDestino - sumaAtp) > 0.01m)
+                diferencia = $"suma MONTOTOTALLINEA 11g={sumaDestino} vs ATP={sumaAtp}";
+
+            return diferencia == null;
+        }
+
+        // REVISION v5: true si la factura está en revisión y todavía no le toca reintento.
+        private bool EnDescanso(string numFacturaOracle, int ciclo)
+        {
+            int proximo;
+            return _enRevision.TryGetValue(numFacturaOracle, out proximo) && proximo > ciclo;
+        }
+
+        // REVISION v5: deja en el log cuántos números están repetidos entre los pendientes de ATP.
+        // Esos no los toma el SELECT del traslado y hay que revisarlos a mano.
+        private void RegistrarRepetidosExcluidos()
+        {
+            try
+            {
+                using (var con = OpenSrc())
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.BindByName = true;
+                    cmd.CommandText = @"
+                        SELECT COUNT(*) AS NUMEROS, NVL(SUM(CANT), 0) AS FILAS
+                          FROM (SELECT TRIM(NUM_FACTURA_ORACLE) AS NUM, COUNT(*) AS CANT
+                                  FROM VENDOCENCFED
+                                 WHERE NVL(INDTRASLADO,'N') = 'N'
+                                   AND CIA = :pCIA
+                                   AND TIPODOC IS NOT NULL
+                                   AND NUM_FACTURA_ORACLE IS NOT NULL
+                                 GROUP BY TRIM(NUM_FACTURA_ORACLE)
+                                HAVING COUNT(*) > 1)";
+                    cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+
+                    using (var rd = cmd.ExecuteReader())
+                    {
+                        if (rd.Read() && Convert.ToInt32(rd["NUMEROS"]) > 0)
+                            _log($"REPETIDOS EN ATP SIN TRASLADAR (revisión manual) | Números={rd["NUMEROS"]} | Filas={rd["FILAS"]}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"No se pudo contar repetidos en ATP | {ex.Message}");
+            }
         }
 
         private ResultadoTraslado EsperarOMarcarError(FacturaInfo factura, string motivo, string ctx)
@@ -1506,8 +1664,10 @@ namespace ServiceInvoicetoNavius
 
             // El origen puede tardar más que MaxCiclosEspera; nunca bloquearlo permanentemente.
             // Sin una tabla persistente de reintentos, mantener N y registrar el diagnóstico.
-            _log($"PENDIENTE PROLONGADO ({ciclos} ciclos) | {ctx} | {motivo}");
-            return ResultadoTraslado.Pendiente;
+            // REVISION v5: sigue en 'N' (no se toca ATP), pero se devuelve Error para que
+            // descanse CiclosReintentoRevision ciclos y no se reintente en cada ciclo.
+            _log($"PENDIENTE PROLONGADO ({ciclos} ciclos) | {ctx} | {motivo} | Próximo reintento en {_opciones.CiclosReintentoRevision} ciclos");
+            return ResultadoTraslado.Error;
         }
 
         private DataTable LeerAtp(string sql, string numFacturaOracle, string tipoDoc)
@@ -1744,6 +1904,18 @@ namespace ServiceInvoicetoNavius
             return d;
         }
 
+        // REVISION v5: equivalencia de tipos entre ATP y 11g.
+        // GuardarFacturas guarda como tiquete ('04') una factura ('01') sin receptor válido.
+        private static string TipoEquivalenteEnAtp(string tipo11g)
+        {
+            return tipo11g == "04" ? "01" : tipo11g;
+        }
+
+        private static string TipoEquivalenteEn11g(string tipoAtp)
+        {
+            return tipoAtp == "01" ? "04" : tipoAtp;
+        }
+
         public void EjecutarGuardarFacturas(int pLote)
         {
             using (var conDst = OpenDst())
@@ -1752,7 +1924,11 @@ namespace ServiceInvoicetoNavius
                 cmd.BindByName = true;
                 cmd.CommandType = CommandType.StoredProcedure;
                 cmd.CommandText = "NUEVO.facturaElecOracle.GuardarFacturas";
-                cmd.CommandTimeout = 180; // timeout de cliente; DB puede seguir hasta cancelar
+                // REVISION v5: configurable (TimeoutGuardarFacturasSeg, 0 = sin límite).
+                // Al vencer, ODP.NET cancela la llamada en la base (ORA-01013) y el paquete
+                // revierte TODO el lote, con los consecutivos ya consumidos. Debe ser
+                // bastante mayor que lo que tarda un lote normal.
+                cmd.CommandTimeout = Math.Max(0, _opciones.TimeoutGuardarFacturasSeg);
                 cmd.Parameters.Add("p_lote", OracleDbType.Int32, Math.Max(1, pLote), ParameterDirection.Input);
                 cmd.ExecuteNonQuery();
             }
@@ -1861,12 +2037,15 @@ namespace ServiceInvoicetoNavius
                         {
                             cmdBuscar.BindByName = true;
                             // ARREGLO 5: número + tipo de documento, sin ROWNUM = 1
+                            // REVISION v5: GuardarFacturas convierte una factura 01 en tiquete 04
+                            // cuando no hay receptor válido. En 11g queda '04' y en ATP sigue '01';
+                            // por eso un '04' de 11g se busca en ATP como '04' o '01'.
                             cmdBuscar.CommandText = @"
                                 SELECT ROWIDTOCHAR(ROWID) AS RID,
                                        CLAVE
                                   FROM VENDOCENCFED
                                  WHERE NUM_FACTURA_ORACLE = :pDOCUMENTO
-                                   AND TRIM(TIPODOC) = :pTIPODOC
+                                   AND TRIM(TIPODOC) IN (:pTIPODOC, :pTIPOALT)
                                    AND CIA = :pCIA";
 
                             cmdBuscar.Parameters.Add(
@@ -1879,6 +2058,12 @@ namespace ServiceInvoicetoNavius
                                 ":pTIPODOC",
                                 OracleDbType.Varchar2,
                                 tipoDoc,
+                                ParameterDirection.Input);
+
+                            cmdBuscar.Parameters.Add(
+                                ":pTIPOALT",
+                                OracleDbType.Varchar2,
+                                TipoEquivalenteEnAtp(tipoDoc),
                                 ParameterDirection.Input);
 
                             cmdBuscar.Parameters.Add(
@@ -2446,17 +2631,23 @@ namespace ServiceInvoicetoNavius
                     // ========================================================
                     cmdSel.BindByName = true;
 
+                    // ARREGLO 5: filtra por tipo.
+                    // REVISION v5: una factura 01 de ATP puede estar en 11g como tiquete 04
+                    // (GuardarFacturas la convierte si no hay receptor válido). Se acepta
+                    // el tipo equivalente y se prefiere el tipo exacto si existieran ambos.
                     cmdSel.CommandText = @"
-                SELECT CLAVE,
-                       NUMEROCONSECUTIVO,
-                       ESTADO,
-                       MENSAJE_HACIENDA
-                FROM VENDOCENCFED
-                WHERE DOCUMENTO = :pNUM_FACTURA_ORACLE
-                  AND ESTADO = 'A'
-                  AND TRIM(TIPODOC) = :pTIPODOC
-                  AND CIA = :pCIA
-                  AND ROWNUM = 1";  // ARREGLO 5: filtra por tipo
+                SELECT * FROM (
+                    SELECT CLAVE,
+                           NUMEROCONSECUTIVO,
+                           ESTADO,
+                           MENSAJE_HACIENDA
+                    FROM VENDOCENCFED
+                    WHERE DOCUMENTO = :pNUM_FACTURA_ORACLE
+                      AND ESTADO = 'A'
+                      AND TRIM(TIPODOC) IN (:pTIPODOC, :pTIPOALT)
+                      AND CIA = :pCIA
+                    ORDER BY CASE WHEN TRIM(TIPODOC) = :pTIPODOC THEN 0 ELSE 1 END
+                ) WHERE ROWNUM = 1";
 
                     var pNumero11g = cmdSel.Parameters.Add(
                         ":pNUM_FACTURA_ORACLE",
@@ -2465,6 +2656,7 @@ namespace ServiceInvoicetoNavius
 
                     cmdSel.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
                     var pTipo11g = cmdSel.Parameters.Add(":pTIPODOC", OracleDbType.Varchar2);
+                    var pTipoAlt11g = cmdSel.Parameters.Add(":pTIPOALT", OracleDbType.Varchar2);
 
                     // ========================================================
                     // UPDATE ATP
@@ -2526,6 +2718,7 @@ namespace ServiceInvoicetoNavius
 
                         pNumero11g.Value = numeroFactura;
                         pTipo11g.Value = tipoDoc;
+                        pTipoAlt11g.Value = TipoEquivalenteEn11g(tipoDoc);   // REVISION v5
                         pTipoAtp.Value = tipoDoc;
 
                         using (var rd = cmdSel.ExecuteReader())

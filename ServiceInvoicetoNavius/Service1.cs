@@ -22,6 +22,10 @@ namespace ServiceInvoicetoNavius
         // ARREGLO 8: se activa en OnStop para que el ciclo en curso no siga con pasos nuevos.
         private volatile bool _deteniendo = false;
 
+        // REVISION v5: OnStop debe esperar al menos lo que puede durar GuardarFacturas;
+        // si mata el proceso a mitad del lote, el paquete revierte todo el lote.
+        private int _timeoutGuardarSeg = 600;
+
         public Service1()
         {
             InitializeComponent();
@@ -83,14 +87,21 @@ namespace ServiceInvoicetoNavius
                     MaxFacturasPorCiclo = Math.Max(1, Math.Min(100, LeerEntero("MaxFacturasPorCiclo", 10))),
                     ValidarMontos = LeerBooleano("ValidarMontos", true),
                     ToleranciaMonto = LeerDecimal("ToleranciaMonto", 1.00m),
-                    MaxCiclosEspera = LeerEntero("MaxCiclosEspera", 5)
+                    MaxCiclosEspera = LeerEntero("MaxCiclosEspera", 5),
+                    // REVISION v5
+                    CiclosReintentoRevision = Math.Max(1, LeerEntero("CiclosReintentoRevision", 15)),
+                    TimeoutGuardarFacturasSeg = Math.Max(0, LeerEntero("TimeoutGuardarFacturasSeg", 600))
                 };
+
+                _timeoutGuardarSeg = opciones.TimeoutGuardarFacturasSeg;
 
                 _log.Info($"CIA configurada para el servicio: {ciaFiltro}");
                 _log.Info(
                     $"Opciones: MaxDegree={maxDegree} | IntervalMs={intervalMs} | " +
                     $"MaxFacturasPorCiclo={opciones.MaxFacturasPorCiclo} | ValidarMontos={opciones.ValidarMontos} | " +
-                    $"ToleranciaMonto={opciones.ToleranciaMonto} | MaxCiclosEspera={opciones.MaxCiclosEspera}");
+                    $"ToleranciaMonto={opciones.ToleranciaMonto} | MaxCiclosEspera={opciones.MaxCiclosEspera} | " +
+                    $"CiclosReintentoRevision={opciones.CiclosReintentoRevision} | " +
+                    $"LoteGuardarFacturas={LeerLoteGuardarFacturas()} | TimeoutGuardarFacturasSeg={opciones.TimeoutGuardarFacturasSeg}");
                 _log.Info("Inicializando OracleAtp...");
 
                 // =========================================================
@@ -147,8 +158,10 @@ namespace ServiceInvoicetoNavius
                 _proceso?.SolicitarDetencion();
                 _timer?.Stop();
 
-                // ...y se espera a que termine lo que está en curso (máximo 5 minutos).
-                var limite = DateTime.Now.AddMinutes(5);
+                // ...y se espera a que termine lo que está en curso.
+                // REVISION v5: mínimo 5 minutos, o el timeout de GuardarFacturas + 1 minuto.
+                int esperaSeg = Math.Max(300, (_timeoutGuardarSeg > 0 ? _timeoutGuardarSeg : 1800) + 60);
+                var limite = DateTime.Now.AddSeconds(esperaSeg);
 
                 while (Interlocked.CompareExchange(ref _running, 0, 0) == 1 && DateTime.Now < limite)
                 {
@@ -157,7 +170,7 @@ namespace ServiceInvoicetoNavius
                 }
 
                 if (Interlocked.CompareExchange(ref _running, 0, 0) == 1)
-                    _log?.Info("Servicio detenido con un ciclo todavía en curso (se superaron 5 minutos).");
+                    _log?.Info($"Servicio detenido con un ciclo todavía en curso (se superaron {esperaSeg} segundos).");
 
                 _timer?.Dispose();
                 _log?.Info("Servicio detenido.");
@@ -197,7 +210,7 @@ namespace ServiceInvoicetoNavius
 
         private void RunJob()
         {
-            int lote = Math.Max(1, Math.Min(100, LeerEntero("LoteGuardarFacturas", 10)));
+            int lote = LeerLoteGuardarFacturas();
 
             // =========================================================
             // 0. ARREGLO 8: verificar conexiones (antes estaba en OnStart).
@@ -215,72 +228,69 @@ namespace ServiceInvoicetoNavius
             _log.Info("Iniciando ciclo...");
 
             // =========================================================
-            // 1. Trasladar facturas ATP -> Oracle 11g
-            //    OracleAtp aplica automáticamente el filtro de CIA.
+            // REVISION v5: cada paso va aislado. Si uno falla (por ejemplo ATP no
+            // responde, o el paquete todavía no tiene el parámetro p_lote), se
+            // registra y se sigue con los demás. Antes, un error en el paso 1
+            // o 2 se saltaba todas las sincronizaciones del ciclo.
             // =========================================================
-            int copiadas = _proceso.VENDOCENCFED();
 
-            _log.Info(
-                $"VENDOCENCFED finalizó. Facturas trasladadas: {copiadas}"
-            );
+            // 1. Trasladar facturas ATP -> Oracle 11g (OracleAtp aplica el filtro de CIA)
+            if (!Paso("VENDOCENCFED", () =>
+                _log.Info($"VENDOCENCFED finalizó. Facturas trasladadas: {_proceso.VENDOCENCFED()}"))) return;
 
-            if (_deteniendo) { _log.Info("Ciclo interrumpido: el servicio se está deteniendo."); return; }
-
-            // =========================================================
             // 2. Procesar facturas en Oracle 11g
-            // =========================================================
-            _log.Info("Inicio de EjecutarGuardarFacturas");
+            if (!Paso("GuardarFacturas", () =>
+            {
+                _log.Info($"Inicio de EjecutarGuardarFacturas (lote={lote})");
+                _proceso.EjecutarGuardarFacturas(lote);
+                _log.Info("GuardarFacturas ejecutado.");
+            })) return;
 
-            _proceso.EjecutarGuardarFacturas(lote);
-
-            _log.Info("GuardarFacturas ejecutado. Ciclo OK.");
-
-            if (_deteniendo) { _log.Info("Ciclo interrumpido: el servicio se está deteniendo."); return; }
-
-            // =========================================================
             // 3. Sincronizar facturas aceptadas / procesadas
-            // =========================================================
-            int sync = _proceso.SincronizarEstadoHacienda_PorDocumento();
+            if (!Paso("SincronizarEstadoHacienda_PorDocumento", () =>
+                _log.Info($"SincronizarEstadoHacienda_PorDocumento procesó: {_proceso.SincronizarEstadoHacienda_PorDocumento()}"))) return;
 
-            _log.Info(
-                $"SincronizarEstadoHacienda_PorDocumento procesó: {sync}"
-            );
+            // 4. Facturas ATP sin clave que estén rechazadas en 11g
+            if (!Paso("SincronizarFacturasRechazadasSinClave", () =>
+                _log.Info($"SincronizarFacturasRechazadasSinClave actualizó: {_proceso.SincronizarFacturasRechazadasSinClave()}"))) return;
 
-            if (_deteniendo) { _log.Info("Ciclo interrumpido: el servicio se está deteniendo."); return; }
+            // 5. Facturas ATP sin clave que estén aceptadas en 11g
+            if (!Paso("SincronizarFacturasAceptadasSinClave", () =>
+                _log.Info($"SincronizarFacturasAceptadasSinClave actualizó: {_proceso.SincronizarFacturasAceptadasSinClave()}"))) return;
 
-            // =========================================================
-            // 4. Buscar facturas ATP sin clave que estén rechazadas
-            //    en Oracle 11g
-            // =========================================================
-            int rechazadas = _proceso.SincronizarFacturasRechazadasSinClave();
+            // 6. Sincronizar FECHA_FACTURAELECTRONICA 11g -> ATP
+            Paso("SincronizarFechaFacturaElectronica", () =>
+                _log.Info($"SincronizarFechaFacturaElectronica actualizó: {_proceso.SincronizarFechaFacturaElectronica()}"));
 
-            _log.Info(
-                $"SincronizarFacturasRechazadasSinClave actualizó: {rechazadas}"
-            );
+            _log.Info("Ciclo terminado.");
+        }
 
-            if (_deteniendo) { _log.Info("Ciclo interrumpido: el servicio se está deteniendo."); return; }
+        // REVISION v5: ejecuta un paso del ciclo; si falla lo registra y deja seguir.
+        // Devuelve false solo si el servicio se está deteniendo (para cortar el ciclo).
+        private bool Paso(string nombre, Action accion)
+        {
+            try
+            {
+                accion();
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"ERROR en el paso {nombre}; se continúa con el siguiente paso", ex);
+            }
 
-            // =========================================================
-            // 5. Buscar facturas ATP sin clave que estén aceptadas
-            //    en Oracle 11g
-            // =========================================================
-            int aceptadas = _proceso.SincronizarFacturasAceptadasSinClave();
+            if (_deteniendo)
+            {
+                _log.Info("Ciclo interrumpido: el servicio se está deteniendo.");
+                return false;
+            }
 
-            _log.Info(
-                $"SincronizarFacturasAceptadasSinClave actualizó: {aceptadas}"
-            );
+            return true;
+        }
 
-            if (_deteniendo) { _log.Info("Ciclo interrumpido: el servicio se está deteniendo."); return; }
-
-            // =========================================================
-            // 6. Sincronizar FECHA_FACTURAELECTRONICA
-            //    Oracle 11g -> ATP
-            // =========================================================
-            int fechasActualizadas = _proceso.SincronizarFechaFacturaElectronica();
-
-            _log.Info(
-                $"SincronizarFechaFacturaElectronica actualizó: {fechasActualizadas}"
-            );
+        // REVISION v5: lote de GuardarFacturas (1..100). Por defecto 10.
+        private int LeerLoteGuardarFacturas()
+        {
+            return Math.Max(1, Math.Min(100, LeerEntero("LoteGuardarFacturas", 10)));
         }
 
         // =================================================================
