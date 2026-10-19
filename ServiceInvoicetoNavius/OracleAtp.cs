@@ -1,6 +1,7 @@
 ﻿using Oracle.ManagedDataAccess.Client;
 using Oracle.ManagedDataAccess;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
@@ -42,9 +43,11 @@ namespace ServiceInvoicetoNavius
             string userDestino, string passDestino,
             string ciaFiltro,
             int maxDegree = 4,
-            Action<string> logger = null)
+            Action<string> logger = null,
+            OpcionesTraslado opciones = null)   // ARREGLO 8
         {
             _log = logger ?? (_ => { });
+            _opciones = opciones ?? new OpcionesTraslado();   // ARREGLO 8
             _maxDegree = Math.Max(1, maxDegree);
 
             if (string.IsNullOrWhiteSpace(ciaFiltro))
@@ -887,7 +890,8 @@ namespace ServiceInvoicetoNavius
                            SET INDTRASLADO = 'E',
                                MENSAJE_HACIENDA = SUBSTR(:pERROR, 1, 4000)
                          WHERE NUM_FACTURA_ORACLE = :pNUM_FACTURA_ORACLE
-                           AND CIA = :pCIA";
+                           AND CIA = :pCIA
+                           AND NVL(INDTRASLADO,'N') = 'N'";  // ARREGLO 4: solo filas pendientes
 
                     cmd.Parameters.Add(":pERROR", OracleDbType.Varchar2, error, ParameterDirection.Input);
                     cmd.Parameters.Add(":pNUM_FACTURA_ORACLE", OracleDbType.Varchar2, factura.NumFacturaOracle, ParameterDirection.Input);
@@ -1077,10 +1081,94 @@ namespace ServiceInvoicetoNavius
             return false;
         }
 
+        // =====================================================================================
+        // TRASLADO ATP -> 11g  (ARREGLOS 1 a 4)
+        // Cada factura se traslada completa o no se traslada:
+        //   detalle -> impuestos -> encabezado (de último) -> COMMIT, en UNA transacción.
+        // OracleBulkCopy no puede participar en una transacción externa, por eso aquí se
+        // usa INSERT con array binding (InsertarArrayBind).
+        // =====================================================================================
+
+        // Valores configurables desde App.config (ver Service1.LeerOpciones).
+        // Si la llave no existe en el .config, se usa el valor por defecto de aquí.
+        public sealed class OpcionesTraslado
+        {
+            // ARREGLO 8: máximo de facturas que se trasladan por ciclo (0 = sin límite).
+            public int MaxFacturasPorCiclo { get; set; } = 50;
+
+            // ARREGLO 2: validar que el total del encabezado cuadre con la suma de líneas.
+            // Se puede apagar desde el .config sin recompilar si diera falsos positivos.
+            public bool ValidarMontos { get; set; } = true;
+
+            // Diferencia máxima aceptada entre el total del encabezado y la suma de las líneas.
+            public decimal ToleranciaMonto { get; set; } = 1.00m;
+
+            // Ciclos que se espera a que la integración termine de cargar una factura en ATP
+            // antes de marcarla con error (con IntervalMs=240000, 5 ciclos = 20 minutos).
+            public int MaxCiclosEspera { get; set; } = 5;
+        }
+
+        private readonly OpcionesTraslado _opciones;
+
+        // ARREGLO 8: lo activa Service1.OnStop para no empezar facturas nuevas al detenerse.
+        private volatile bool _detener;
+
+        public void SolicitarDetencion()
+        {
+            _detener = true;
+        }
+
+        private readonly ConcurrentDictionary<string, int> _ciclosEspera =
+            new ConcurrentDictionary<string, int>();
+
+        private readonly ConcurrentDictionary<string, Dictionary<string, ColumnaDestinoInfo>> _cacheColumnas =
+            new ConcurrentDictionary<string, Dictionary<string, ColumnaDestinoInfo>>(StringComparer.OrdinalIgnoreCase);
+
+        private enum ResultadoTraslado { Ok, Pendiente, Error }
+
+        private sealed class GrupoFactura
+        {
+            public string NumFacturaOracle { get; set; }
+            public List<DataRow> Filas { get; set; }
+            public DataTable Cabecera { get; set; }
+        }
+
+        // Mismo filtro que usa GuardarFacturas (codigo_tipo = tipodoc): si el paquete no va
+        // a tomar una línea, el servicio tampoco la cuenta como detalle.
+        private const string SqlDetalleAtp = @"
+            SELECT CIA, CLAVE, LINEADETALLE,
+                   CODIGO_TIPO, CODIGO_COD, CANTIDAD,
+                   UNIDADMEDIDA, UNIDADMEDIDACOMERCIAL, DETALLE,
+                   PRECIOUNITARIO, MONTOTOTAL, MONTODESCUENTO,
+                   NATURALEZADESCUENTO, SUBTOTAL, TOTALIMPUESTOS,
+                   MONTOTOTALLINEA, BASEIMPONIBLE, PARTIDAARANCELARIA,
+                   COD_CABYS, SUGERIDO, MED_IMP,
+                   PRECIO_IMP, CLASIFICACION, CODIGO_DESCUENTO,
+                   IVACOBRADOFABRICA, IVAASUMIDOEMISOR, REG_MEDICAMENTO,
+                   FOR_FARMACEUTICA, CODIGO_COMBO, CODIGO_BONIF, LINEACOMBO,
+                   ID_FACTURA_ORACLE, NUM_FACTURA_ORACLE, BULTOS, COMENTARIOS, LOTE,
+                   source_schedule_number, CODIGO_IMPUESTO, TASA_IMPUESTO
+              FROM VENDOCDETFED
+             WHERE NUM_FACTURA_ORACLE = :p
+               AND CIA = :pCIA
+               AND CODIGO_TIPO = :pTIPO";
+
+        private const string SqlImpuestoAtp = @"
+            SELECT CIA, CLAVE, LINEADETALLE,
+                   CODIGO, TARIFA, MONTO,
+                   EXONERA_TIPODOC, EXONERA_NUMDOC, EXONERA_NOMINSTIT,
+                   EXONERA_FECHAEMISION, EXONERA_MONTOIMP, EXONERA_PORCCOMPRA,
+                   CODIGOTARIFA, FACTORIVA, CODIGO_COMBO,
+                   CODIGO_BONIF, EXONERA_ARTICULO, EXONERA_INCISO, NUM_FACTURA_ORACLE
+              FROM VENDOCDETIMPFED
+             WHERE NUM_FACTURA_ORACLE = :p
+               AND CIA = :pCIA";
+
         public int VENDOCENCFED()
         {
             ValidarIndicesDestino();
 
+            // SELECT de encabezados: SIN CAMBIOS respecto a la versión original.
             const string selectBase = @"
                 SELECT CIA, CLAVE, TIPODOC,
                        NUMEROCONSECUTIVO, FECHAEMISION, EMISOR_NOMBRE,
@@ -1138,294 +1226,506 @@ namespace ServiceInvoicetoNavius
 
                 using (var da = new OracleDataAdapter(cmd))
                     da.Fill(dt);
-
-                if (dt.Rows.Count == 0)
-                {
-                    _log("No hay registros pendientes INDTRASLADO='N'.");
-                    return 0;
-                }
-
-                _log($"ATP cabeceras leídas: {dt.Rows.Count}");
             }
 
-            var facturas = dt.Rows
+            if (dt.Rows.Count == 0)
+            {
+                _log("No hay registros pendientes INDTRASLADO='N'.");
+                return 0;
+            }
+
+            _log($"ATP cabeceras leídas: {dt.Rows.Count}");
+
+            // Se agrupa y se arma la tabla de cada encabezado ANTES del paralelo
+            // (el DataTable original no se toca desde varios hilos).
+            var grupos = new List<GrupoFactura>();
+
+            foreach (var g in dt.Rows
                 .Cast<DataRow>()
                 .Where(r => !string.IsNullOrWhiteSpace(r["NUM_FACTURA_ORACLE"]?.ToString()))
-                .Select(r => new FacturaInfo
+                .GroupBy(r => r["NUM_FACTURA_ORACLE"].ToString().Trim()))
+            {
+                var filas = g.ToList();
+                var cab = dt.Clone();
+                cab.ImportRow(filas[0]);
+
+                grupos.Add(new GrupoFactura
                 {
-                    NumFacturaOracle = r["NUM_FACTURA_ORACLE"]?.ToString()?.Trim(),
-                    Documento = r["DOCUMENTO"]?.ToString()?.Trim(),
-                    Clave = r["CLAVE"]?.ToString()?.Trim()
-                })
-                .GroupBy(x => x.NumFacturaOracle)
-                .Select(g => g.First())
+                    NumFacturaOracle = g.Key,
+                    Filas = filas,
+                    Cabecera = cab
+                });
+            }
+
+            // ARREGLO 8: procesar por lotes. Las facturas que ya están "en espera" van al final
+            // para que no ocupen el lote mientras haya facturas nuevas por trasladar.
+            int totalPendientes = grupos.Count;
+
+            grupos = grupos
+                .OrderBy(x => _ciclosEspera.ContainsKey(x.NumFacturaOracle) ? 1 : 0)   // OrderBy es estable: respeta el ORDER BY del SELECT
                 .ToList();
 
-            var facturasValidas = new List<FacturaInfo>();
-            var rowsCabeceraValidas = dt.Clone();
+            if (_opciones.MaxFacturasPorCiclo > 0 && grupos.Count > _opciones.MaxFacturasPorCiclo)
+                grupos = grupos.Take(_opciones.MaxFacturasPorCiclo).ToList();
 
-            foreach (var factura in facturas)
-            {
-                string errorCabecera;
+            _log($"Facturas pendientes en ATP: {totalPendientes} | Se procesan en este ciclo: {grupos.Count}");
 
-                if (ExisteCabeceraEnDestino(factura, out errorCabecera))
-                {
-                    MarcarFacturaConError(factura, errorCabecera);
-                    _log($"Cabecera omitida por duplicado | Documento={factura.Documento} | FacturaOracle={factura.NumFacturaOracle}");
-                    continue;
-                }
-
-                var rows = dt.Rows
-                    .Cast<DataRow>()
-                    .Where(r => r["NUM_FACTURA_ORACLE"]?.ToString()?.Trim() == factura.NumFacturaOracle);
-
-                foreach (var row in rows)
-                    rowsCabeceraValidas.ImportRow(row);
-
-                facturasValidas.Add(factura);
-            }
-
-            if (facturasValidas.Count == 0)
-            {
-                _log("No hay facturas válidas para trasladar. Todas quedaron con error.");
-                return dt.Rows.Count;
-            }
-
-            BulkCopyConDiagnostico(
-                rowsCabeceraValidas,
-                "XXORA_VENDOCENCFED",
-                "Traslado de cabeceras VENDOCENCFED");
-
-            _log($"Bulk cabeceras OK en 11g. Insertadas={rowsCabeceraValidas.Rows.Count}");
-
-            var resultados = CopiarDetallesEnParalelo(facturasValidas);
-
-            var exitosas = resultados
-                .Where(x => x.Ok)
-                .Select(x => x.Factura.NumFacturaOracle)
-                .Distinct()
-                .ToList();
-
-            var fallidas = resultados
-                .Where(x => !x.Ok)
-                .ToList();
-
-            foreach (var f in fallidas)
-            {
-                _log("===========================================");
-                _log("FACTURA NO MARCADA COMO TRASLADADA");
-                _log($"Documento      : {f.Factura.Documento}");
-                _log($"Factura Oracle : {f.Factura.NumFacturaOracle}");
-                _log($"Clave FE       : {f.Factura.Clave}");
-                _log($"Error          : {f.Error}");
-                _log("===========================================");
-            }
-
-            if (exitosas.Count > 0)
-            {
-                using (var conSrc = OpenSrc())
-                using (var upd = conSrc.CreateCommand())
-                {
-                    upd.BindByName = true;
-                    upd.CommandText = @"
-                        UPDATE VENDOCENCFED
-                           SET INDTRASLADO = 'S'
-                         WHERE NUM_FACTURA_ORACLE = :p
-                           AND CIA = :pCIA";
-
-                    upd.ArrayBindCount = exitosas.Count;
-
-                    var ciasExitosas = Enumerable.Repeat(_ciaFiltro, exitosas.Count).ToArray();
-
-                    upd.Parameters.Add(":p", OracleDbType.Varchar2, exitosas.ToArray(), ParameterDirection.Input);
-                    upd.Parameters.Add(":pCIA", OracleDbType.Varchar2, ciasExitosas, ParameterDirection.Input);
-
-                    int afectados = upd.ExecuteNonQuery();
-                    _log($"ATP marcados INDTRASLADO='S': {afectados}");
-                }
-            }
-
-            _log($"Resumen traslado: Exitosas={exitosas.Count}, Fallidas={fallidas.Count}");
-
-            return dt.Rows.Count;
-        }
-
-        private List<ResultadoDetalle> CopiarDetallesEnParalelo(IList<FacturaInfo> facturas)
-        {
-            var resultados = new List<ResultadoDetalle>();
+            int ok = 0, pendientes = 0, errores = 0;
             var lockObj = new object();
-
             var po = new ParallelOptions { MaxDegreeOfParallelism = _maxDegree };
 
-            Parallel.ForEach(facturas, po, factura =>
+            Parallel.ForEach(grupos, po, (g, estado) =>
             {
-                string etapa = "";
+                // ARREGLO 8: si el servicio se está deteniendo, no se empiezan facturas nuevas.
+                // Las que ya están en curso terminan su transacción normalmente.
+                if (_detener)
+                {
+                    estado.Stop();
+                    return;
+                }
+
+                ResultadoTraslado r;
 
                 try
                 {
-                    etapa = "Leyendo VENDOCDETFED desde ATP";
-
-                    var dtDet = new DataTable();
-
-                    using (var conSrc = OpenSrc())
-                    using (var cmd = conSrc.CreateCommand())
-                    {
-                        cmd.BindByName = true;
-                        cmd.CommandText = @"
-                            SELECT CIA, CLAVE, LINEADETALLE,
-                                   CODIGO_TIPO, CODIGO_COD, CANTIDAD,
-                                   UNIDADMEDIDA, UNIDADMEDIDACOMERCIAL, DETALLE,
-                                   PRECIOUNITARIO, MONTOTOTAL, MONTODESCUENTO,
-                                   NATURALEZADESCUENTO, SUBTOTAL, TOTALIMPUESTOS,
-                                   MONTOTOTALLINEA, BASEIMPONIBLE, PARTIDAARANCELARIA,
-                                   COD_CABYS, SUGERIDO, MED_IMP,
-                                   PRECIO_IMP, CLASIFICACION, CODIGO_DESCUENTO,
-                                   IVACOBRADOFABRICA, IVAASUMIDOEMISOR, REG_MEDICAMENTO,
-                                   FOR_FARMACEUTICA, CODIGO_COMBO, CODIGO_BONIF, LINEACOMBO,
-                                   ID_FACTURA_ORACLE, NUM_FACTURA_ORACLE, BULTOS, COMENTARIOS, LOTE,source_schedule_number,CODIGO_IMPUESTO,TASA_IMPUESTO
-                            FROM VENDOCDETFED
-                            WHERE NUM_FACTURA_ORACLE = :p
-                              AND CIA = :pCIA";
-
-                        cmd.Parameters.Add(":p", OracleDbType.Varchar2, factura.NumFacturaOracle, ParameterDirection.Input);
-                        cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
-
-                        using (var da = new OracleDataAdapter(cmd))
-                            da.Fill(dtDet);
-                    }
-
-                    etapa = "Validando PK detalle en destino";
-
-                    string errorPkDetalle;
-                    if (ExisteDetalleEnDestino(dtDet, factura, out errorPkDetalle))
-                    {
-                        MarcarFacturaConError(factura, errorPkDetalle);
-
-                        lock (lockObj)
-                        {
-                            resultados.Add(new ResultadoDetalle
-                            {
-                                Factura = factura,
-                                Ok = false,
-                                Error = errorPkDetalle
-                            });
-                        }
-
-                        return;
-                    }
-
-                    etapa = "Leyendo VENDOCDETIMPFED desde ATP";
-
-                    var dtImp = new DataTable();
-
-                    using (var conSrc = OpenSrc())
-                    using (var cmd = conSrc.CreateCommand())
-                    {
-                        cmd.BindByName = true;
-                        cmd.CommandText = @"
-                            SELECT CIA, CLAVE, LINEADETALLE,
-                                   CODIGO, TARIFA, MONTO,
-                                   EXONERA_TIPODOC, EXONERA_NUMDOC, EXONERA_NOMINSTIT,
-                                   EXONERA_FECHAEMISION, EXONERA_MONTOIMP, EXONERA_PORCCOMPRA,
-                                   CODIGOTARIFA, FACTORIVA, CODIGO_COMBO,
-                                   CODIGO_BONIF, EXONERA_ARTICULO, EXONERA_INCISO, NUM_FACTURA_ORACLE
-                            FROM VENDOCDETIMPFED
-                            WHERE NUM_FACTURA_ORACLE = :p
-                              AND CIA = :pCIA";
-
-                        cmd.Parameters.Add(":p", OracleDbType.Varchar2, factura.NumFacturaOracle, ParameterDirection.Input);
-                        cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
-
-                        using (var da = new OracleDataAdapter(cmd))
-                            da.Fill(dtImp);
-                    }
-
-                    etapa = "Validando PK impuesto en destino";
-
-                    string errorPkImp;
-                    if (ExisteImpuestoEnDestino(dtImp, factura, out errorPkImp))
-                    {
-                        MarcarFacturaConError(factura, errorPkImp);
-
-                        lock (lockObj)
-                        {
-                            resultados.Add(new ResultadoDetalle
-                            {
-                                Factura = factura,
-                                Ok = false,
-                                Error = errorPkImp
-                            });
-                        }
-
-                        return;
-                    }
-
-                    etapa = "Insertando XXORA_VENDOCDETFED en 11g";
-
-                    if (dtDet.Rows.Count > 0)
-                    {
-                        BulkCopyConDiagnostico(
-                            dtDet,
-                            "XXORA_VENDOCDETFED",
-                            $"Detalle | Documento={factura.Documento} | FacturaOracle={factura.NumFacturaOracle}");
-                    }
-
-                    etapa = "Insertando XXORA_VENDOCDETIMPFED en 11g";
-
-                    if (dtImp.Rows.Count > 0)
-                    {
-                        BulkCopyConDiagnostico(
-                            dtImp,
-                            "XXORA_VENDOCDETIMPFED",
-                            $"Impuesto | Documento={factura.Documento} | FacturaOracle={factura.NumFacturaOracle}");
-                    }
-
-                    _log($"Detalle OK | Documento={factura.Documento} | FacturaOracle={factura.NumFacturaOracle} | LineasDetalle={dtDet.Rows.Count} | LineasImpuesto={dtImp.Rows.Count}");
-
-                    lock (lockObj)
-                    {
-                        resultados.Add(new ResultadoDetalle
-                        {
-                            Factura = factura,
-                            Ok = true,
-                            Error = null
-                        });
-                    }
+                    r = TrasladarFacturaAtomica(g);
                 }
                 catch (Exception ex)
                 {
-                    string errorCompleto =
-                        $"Etapa={etapa} | Documento={factura.Documento} | FacturaOracle={factura.NumFacturaOracle} | Clave={factura.Clave} | Error={ex.Message}";
+                    _log($"ERROR NO CONTROLADO trasladando FacturaOracle={g.NumFacturaOracle} | {ex.Message}");
+                    r = ResultadoTraslado.Error;
+                }
 
-                    MarcarFacturaConError(factura, errorCompleto);
-
-                    _log("===========================================");
-                    _log("ERROR COPIANDO DETALLE");
-                    _log($"Etapa          : {etapa}");
-                    _log($"Documento      : {factura.Documento}");
-                    _log($"Factura Oracle : {factura.NumFacturaOracle}");
-                    _log($"Clave FE       : {factura.Clave}");
-                    _log($"Mensaje        : {ex.Message}");
-
-                    if (ex.InnerException != null)
-                        _log($"InnerException : {ex.InnerException.Message}");
-
-                    _log($"StackTrace     : {ex.StackTrace}");
-                    _log("===========================================");
-
-                    lock (lockObj)
-                    {
-                        resultados.Add(new ResultadoDetalle
-                        {
-                            Factura = factura,
-                            Ok = false,
-                            Error = errorCompleto
-                        });
-                    }
+                lock (lockObj)
+                {
+                    if (r == ResultadoTraslado.Ok) ok++;
+                    else if (r == ResultadoTraslado.Pendiente) pendientes++;
+                    else errores++;
                 }
             });
 
-            return resultados;
+            _log($"Resumen traslado: Exitosas={ok} | En espera={pendientes} | Error={errores}");
+
+            return ok;
+        }
+
+        private ResultadoTraslado TrasladarFacturaAtomica(GrupoFactura g)
+        {
+            string numFacturaOracle = g.NumFacturaOracle;
+            DataRow cab = g.Cabecera.Rows[0];
+
+            var factura = new FacturaInfo
+            {
+                NumFacturaOracle = numFacturaOracle,
+                Documento = cab["DOCUMENTO"]?.ToString()?.Trim(),
+                Clave = cab["CLAVE"]?.ToString()?.Trim()
+            };
+
+            string tipoDoc = cab["TIPODOC"]?.ToString()?.Trim();
+            string idOracle = cab["ID_FACTURA_ORACLE"]?.ToString()?.Trim();
+            string ctx = $"Documento={factura.Documento} | FacturaOracle={numFacturaOracle} | TipoDoc={tipoDoc}";
+
+            // ---------------------------------------------------------------
+            // ARREGLO 3: más de un encabezado pendiente con el mismo número
+            // ---------------------------------------------------------------
+            if (g.Filas.Count > 1)
+            {
+                string err = $"NUM_FACTURA_ORACLE repetido en ATP ({g.Filas.Count} encabezados pendientes). Revisar manualmente.";
+                _log($"OMITIDA | {ctx} | {err}");
+                MarcarFacturaConError(factura, err);
+                return ResultadoTraslado.Error;
+            }
+
+            // ---------------------------------------------------------------
+            // ¿Ya existe en el staging de 11g?
+            // ---------------------------------------------------------------
+            using (var con = OpenDst())
+            {
+                string idEnDestino;
+                int cabEnDestino = ContarCabeceraEnDestino(con, numFacturaOracle, out idEnDestino);
+
+                if (cabEnDestino > 0)
+                {
+                    bool mismaFactura = !string.IsNullOrEmpty(idOracle) && idOracle == idEnDestino;
+                    int detEnDestino = ContarEnDestino(con, "XXORA_VENDOCDETFED", numFacturaOracle);
+
+                    // PROTECCION: un detalle existente NO demuestra que la factura este completa.
+                    // Hasta disponer de comparacion exhaustiva y clave unica, se bloquea
+                    // cualquier reconciliacion automatica de una cabecera preexistente.
+                    if (mismaFactura && detEnDestino > 0)
+                    {
+                        string advertencia = "Cabecera preexistente: verificar conjunto completo de detalle/impuestos antes de marcar ATP como trasladada";
+                        _log($"REVISION MANUAL | {ctx} | {advertencia}");
+                        return ResultadoTraslado.Pendiente;
+                    }
+
+                    string err = mismaFactura
+                        ? "Encabezado sin detalle en XXORA_VENDOCENCFED (corrida anterior interrumpida). Revisar antes de reenviar."
+                        : $"NUM_FACTURA_ORACLE ya existe en XXORA_VENDOCENCFED (ID_FACTURA_ORACLE destino={idEnDestino}). Documento repetido.";
+
+                    _log($"ERROR | {ctx} | {err}");
+                    MarcarFacturaConError(factura, err);
+                    return ResultadoTraslado.Error;
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // ARREGLO 2: validar antes de trasladar
+            // ---------------------------------------------------------------
+            DataTable dtDet = LeerAtp(SqlDetalleAtp, numFacturaOracle, tipoDoc);
+            DataTable dtImp = LeerAtp(SqlImpuestoAtp, numFacturaOracle, null);
+
+            if (dtDet.Rows.Count == 0)
+                return EsperarOMarcarError(factura, "Encabezado en ATP sin líneas de detalle", ctx);
+
+            // Validación estructural: no transferir detalle con LINEADETALLE nula o repetida.
+            var clavesDetalle = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DataRow fila in dtDet.Rows)
+            {
+                string linea = fila["LINEADETALLE"] == DBNull.Value ? null : Convert.ToString(fila["LINEADETALLE"], CultureInfo.InvariantCulture).Trim();
+                if (string.IsNullOrEmpty(linea) || !clavesDetalle.Add(linea))
+                {
+                    _log($"DETALLE INCONSISTENTE | {ctx} | LINEADETALLE nula o duplicada={linea}");
+                    return ResultadoTraslado.Pendiente;
+                }
+            }
+            var clavesImpuesto = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DataRow fila in dtImp.Rows)
+            {
+                string linea = Convert.ToString(fila["LINEADETALLE"], CultureInfo.InvariantCulture)?.Trim();
+                string codigo = Convert.ToString(fila["CODIGO"], CultureInfo.InvariantCulture)?.Trim() ?? "";
+                string tarifa = Convert.ToString(fila["CODIGOTARIFA"], CultureInfo.InvariantCulture)?.Trim() ?? "";
+                if (string.IsNullOrEmpty(linea) || !clavesDetalle.Contains(linea) ||
+                    !clavesImpuesto.Add(linea + "|" + codigo + "|" + tarifa))
+                {
+                    _log($"IMPUESTO INCONSISTENTE | {ctx} | LINEADETALLE={linea} CODIGO={codigo} CODIGOTARIFA={tarifa}");
+                    return ResultadoTraslado.Pendiente;
+                }
+            }
+
+            decimal totalCab = Math.Abs(
+                ToDec(cab["TOTALCOMPROBANTE"])
+                - ToDec(cab["TOTALOTROSCARGOS"])
+                + ToDec(cab["TOTALIVADEVUELTO"]));
+
+            decimal totalDet = Math.Abs(dtDet.Rows.Cast<DataRow>().Sum(r => ToDec(r["MONTOTOTALLINEA"])));
+
+            if (_opciones.ValidarMontos && Math.Abs(totalCab - totalDet) > _opciones.ToleranciaMonto)
+            {
+                return EsperarOMarcarError(
+                    factura,
+                    $"Montos no cuadran: encabezado={totalCab} vs suma de líneas={totalDet} ({dtDet.Rows.Count} líneas)",
+                    ctx);
+            }
+
+            // ---------------------------------------------------------------
+            // ARREGLO 1: una factura = una transacción en 11g
+            // ---------------------------------------------------------------
+            using (var con = OpenDst())
+            using (var tx = con.BeginTransaction(IsolationLevel.ReadCommitted))
+            {
+                try
+                {
+                    // ARREGLO 7: si en staging quedaron líneas de esta factura SIN encabezado
+                    // (p. ej. alguien borró el encabezado a mano para reprocesar), se borran
+                    // dentro de esta misma transacción antes de insertar, para no duplicarlas.
+                    // Sin encabezado, GuardarFacturas nunca las procesó.
+                    // No borrar lineas huérfanas de forma automática: la identidad
+                    // NUM_FACTURA_ORACLE puede no ser única entre documentos.
+                    int detHuerfano = ContarEnDestino(con, "XXORA_VENDOCDETFED", numFacturaOracle);
+                    int impHuerfano = ContarEnDestino(con, "XXORA_VENDOCDETIMPFED", numFacturaOracle);
+                    if (detHuerfano + impHuerfano > 0)
+                        throw new InvalidOperationException($"Existen lineas sin cabecera, requiere conciliacion manual | detalle={detHuerfano}, impuesto={impHuerfano}");
+
+                    // El encabezado va de último: GuardarFacturas nunca lo ve sin su detalle.
+                    InsertarArrayBind(con, dtDet, "XXORA_VENDOCDETFED", $"Detalle | {ctx}");
+                    InsertarArrayBind(con, dtImp, "XXORA_VENDOCDETIMPFED", $"Impuesto | {ctx}");
+                    InsertarArrayBind(con, g.Cabecera, "XXORA_VENDOCENCFED", $"Encabezado | {ctx}");
+
+                    // ARREGLO 7: antes del COMMIT, en staging debe estar exactamente lo que se
+                    // insertó (1 encabezado y las mismas líneas). Si otro proceso metió la misma
+                    // factura en paralelo, el conteo no cuadra y se revierte todo.
+                    int cabFinal = ContarEnDestino(con, "XXORA_VENDOCENCFED", numFacturaOracle);
+                    int detFinal = ContarEnDestino(con, "XXORA_VENDOCDETFED", numFacturaOracle);
+                    int impFinal = ContarEnDestino(con, "XXORA_VENDOCDETIMPFED", numFacturaOracle);
+
+                    if (cabFinal != 1 || detFinal != dtDet.Rows.Count || impFinal != dtImp.Rows.Count)
+                    {
+                        throw new Exception(
+                            $"Conteo en staging no coincide (posible duplicado): " +
+                            $"encabezados={cabFinal}/1, detalle={detFinal}/{dtDet.Rows.Count}, impuesto={impFinal}/{dtImp.Rows.Count}");
+                    }
+
+                    tx.Commit();
+                }
+                catch (Exception ex)
+                {
+                    try { tx.Rollback(); } catch { /* si la conexión cayó, Oracle ya hizo rollback */ }
+
+                    string err = $"Traslado revertido (rollback) | {ex.Message}";
+                    _log($"ERROR | {ctx} | {err}");
+                    MarcarFacturaConError(factura, err);
+                    return ResultadoTraslado.Error;
+                }
+            }
+
+            int ignorado;
+            _ciclosEspera.TryRemove(numFacturaOracle, out ignorado);
+
+            _log($"Trasladada OK | {ctx} | LineasDetalle={dtDet.Rows.Count} | LineasImpuesto={dtImp.Rows.Count}");
+
+            // Si este UPDATE falla, el siguiente ciclo la detecta como "YA TRASLADADA".
+            MarcarTrasladada(numFacturaOracle);
+            return ResultadoTraslado.Ok;
+        }
+
+        private ResultadoTraslado EsperarOMarcarError(FacturaInfo factura, string motivo, string ctx)
+        {
+            int ciclos = _ciclosEspera.AddOrUpdate(factura.NumFacturaOracle, 1, (k, v) => v + 1);
+
+            if (ciclos < _opciones.MaxCiclosEspera)
+            {
+                _log($"EN ESPERA ({ciclos}/{_opciones.MaxCiclosEspera}) | {ctx} | {motivo}");
+                return ResultadoTraslado.Pendiente;
+            }
+
+            int ignorado;
+            _ciclosEspera.TryRemove(factura.NumFacturaOracle, out ignorado);
+
+            string err = $"{motivo}. Sin cambios después de {ciclos} ciclos.";
+            _log($"ERROR | {ctx} | {err}");
+            MarcarFacturaConError(factura, err);
+            return ResultadoTraslado.Error;
+        }
+
+        private DataTable LeerAtp(string sql, string numFacturaOracle, string tipoDoc)
+        {
+            var dt = new DataTable();
+
+            using (var con = OpenSrc())
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.InitialLOBFetchSize = -1;
+                cmd.CommandText = sql;
+                cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+
+                if (sql.Contains(":pTIPO"))
+                    cmd.Parameters.Add(":pTIPO", OracleDbType.Varchar2, tipoDoc, ParameterDirection.Input);
+
+                using (var da = new OracleDataAdapter(cmd))
+                    da.Fill(dt);
+            }
+
+            return dt;
+        }
+
+        private int ContarCabeceraEnDestino(OracleConnection con, string numFacturaOracle, out string idFacturaOracle)
+        {
+            idFacturaOracle = null;
+
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.CommandText = @"
+                    SELECT COUNT(1) AS CANT, MAX(ID_FACTURA_ORACLE) AS ID_ORACLE
+                      FROM XXORA_VENDOCENCFED
+                     WHERE NUM_FACTURA_ORACLE = :p
+                       AND CIA = :pCIA";
+                cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+
+                using (var rd = cmd.ExecuteReader())
+                {
+                    if (!rd.Read())
+                        return 0;
+
+                    idFacturaOracle = rd["ID_ORACLE"] == DBNull.Value ? null : rd["ID_ORACLE"].ToString().Trim();
+                    return Convert.ToInt32(rd["CANT"]);
+                }
+            }
+        }
+
+        private int ContarEnDestino(OracleConnection con, string tabla, string numFacturaOracle)
+        {
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.CommandText = $"SELECT COUNT(1) FROM {tabla} WHERE NUM_FACTURA_ORACLE = :p AND CIA = :pCIA";
+                cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                return Convert.ToInt32(cmd.ExecuteScalar());
+            }
+        }
+
+        // ARREGLO 7: borra líneas de staging de esta factura solo si NO tienen encabezado.
+        private int BorrarHuerfanosEnDestino(OracleConnection con, string tabla, string numFacturaOracle)
+        {
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.CommandText =
+                    $"DELETE FROM {tabla} " +
+                    " WHERE NUM_FACTURA_ORACLE = :p AND CIA = :pCIA " +
+                    "   AND NOT EXISTS (SELECT 1 FROM XXORA_VENDOCENCFED e " +
+                    "                    WHERE e.NUM_FACTURA_ORACLE = :p AND e.CIA = :pCIA)";
+                cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        private void MarcarTrasladada(string numFacturaOracle)
+        {
+            try
+            {
+                using (var con = OpenSrc())
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.BindByName = true;
+                    cmd.CommandText = @"
+                        UPDATE VENDOCENCFED
+                           SET INDTRASLADO = 'S'
+                         WHERE NUM_FACTURA_ORACLE = :p
+                           AND CIA = :pCIA
+                           AND NVL(INDTRASLADO,'N') = 'N'";
+                    cmd.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                    cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                    using (var tx = con.BeginTransaction())
+                    {
+                        using (var check = con.CreateCommand())
+                        {
+                            check.BindByName = true;
+                            check.CommandText = @"SELECT COUNT(*) FROM VENDOCENCFED
+                                                   WHERE NUM_FACTURA_ORACLE = :p AND CIA = :pCIA
+                                                     AND NVL(INDTRASLADO,'N') = 'N'";
+                            check.Parameters.Add(":p", OracleDbType.Varchar2, numFacturaOracle, ParameterDirection.Input);
+                            check.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                            int candidatas = Convert.ToInt32(check.ExecuteScalar());
+                            if (candidatas != 1)
+                            {
+                                tx.Rollback();
+                                _log($"NO MARCADA EN ATP | FacturaOracle={numFacturaOracle} | Coincidencias pendientes={candidatas} (se requiere identidad unica)");
+                                return;
+                            }
+                        }
+                        int actualizadas = cmd.ExecuteNonQuery();
+                        if (actualizadas != 1)
+                        {
+                            tx.Rollback();
+                            _log($"NO MARCADA EN ATP | FacturaOracle={numFacturaOracle} | Filas afectadas={actualizadas}");
+                            return;
+                        }
+                        tx.Commit();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"ERROR marcando INDTRASLADO='S' | FacturaOracle={numFacturaOracle} | {ex.Message} (se corrige en el siguiente ciclo)");
+            }
+        }
+
+        // INSERT con array binding dentro de la transacción abierta en la conexión.
+        // Reutiliza ObtenerColumnasDestino / PrepararDatosParaDestino: mismas validaciones
+        // y mismo log de diagnóstico que usaba el bulk copy.
+        private void InsertarArrayBind(OracleConnection con, DataTable datos, string tabla, string contexto)
+        {
+            if (datos == null || datos.Rows.Count == 0)
+                return;
+
+            var columnas = _cacheColumnas.GetOrAdd(tabla, t => ObtenerColumnasDestino(con, t));
+            var prep = PrepararDatosParaDestino(con, datos, tabla, contexto, columnas);
+
+            var nombres = prep.Columns.Cast<DataColumn>().Select(c => c.ColumnName).ToList();
+
+            string sqlInsert =
+                $"INSERT INTO {tabla} ({string.Join(", ", nombres)}) " +
+                $"VALUES ({string.Join(", ", nombres.Select((n, i) => ":p" + i))})";
+
+            // El array binding con columnas LOB/LONG no es confiable en todas las versiones
+            // de ODP.NET. Si la tabla tiene alguna, o si es una sola fila (el encabezado),
+            // se inserta fila por fila con parámetros normales.
+            bool tieneLob = nombres.Any(n => EsTipoLob(columnas[n].DataType));
+
+            if (tieneLob || prep.Rows.Count == 1)
+            {
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.BindByName = true;
+                    cmd.CommandText = sqlInsert;
+
+                    var parametros = nombres
+                        .Select((n, i) => cmd.Parameters.Add(":p" + i, MapearTipoOracle(columnas[n])))
+                        .ToList();
+
+                    foreach (DataRow fila in prep.Rows)
+                    {
+                        for (int i = 0; i < parametros.Count; i++)
+                            parametros[i].Value = fila[i];
+
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+
+                return;
+            }
+
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.BindByName = true;
+                cmd.CommandText = sqlInsert;
+                cmd.ArrayBindCount = prep.Rows.Count;
+
+                for (int i = 0; i < nombres.Count; i++)
+                {
+                    int idx = i;
+                    object[] valores = prep.Rows.Cast<DataRow>().Select(r => r[idx]).ToArray();
+
+                    cmd.Parameters.Add(
+                        ":p" + i,
+                        MapearTipoOracle(columnas[nombres[i]]),
+                        valores,
+                        ParameterDirection.Input);
+                }
+
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private OracleDbType MapearTipoOracle(ColumnaDestinoInfo c)
+        {
+            string t = (c.DataType ?? "").ToUpperInvariant();
+
+            if (t == "NUMBER" || t == "DECIMAL" || t == "NUMERIC" || t == "INTEGER") return OracleDbType.Decimal;
+            // PrepararDatosParaDestino convierte FLOAT/BINARY_FLOAT/BINARY_DOUBLE a double
+            if (t == "FLOAT" || t == "BINARY_DOUBLE" || t == "BINARY_FLOAT") return OracleDbType.Double;
+            if (t == "LONG") return OracleDbType.Long;
+            if (t == "DATE") return OracleDbType.Date;
+            if (t.StartsWith("TIMESTAMP")) return OracleDbType.TimeStamp;
+            if (t == "CLOB") return OracleDbType.Clob;
+            if (t == "NCLOB") return OracleDbType.NClob;
+            if (t == "NVARCHAR2" || t == "NCHAR") return OracleDbType.NVarchar2;
+            if (t == "CHAR") return OracleDbType.Char;
+            if (t == "RAW") return OracleDbType.Raw;
+            if (t == "LONG RAW") return OracleDbType.LongRaw;
+            if (t == "BLOB") return OracleDbType.Blob;
+            return OracleDbType.Varchar2;
+        }
+
+        private static bool EsTipoLob(string dataType)
+        {
+            string t = (dataType ?? "").ToUpperInvariant();
+            return t == "CLOB" || t == "NCLOB" || t == "BLOB" || t == "LONG" || t == "LONG RAW";
+        }
+
+        private decimal ToDec(object v)
+        {
+            if (v == null || v == DBNull.Value) return 0m;
+            decimal d;
+            return decimal.TryParse(Convert.ToString(v, CultureInfo.InvariantCulture),
+                                    NumberStyles.Any, CultureInfo.InvariantCulture, out d) ? d : 0m;
         }
 
         public void EjecutarGuardarFacturas(int pLote)
@@ -1436,8 +1736,8 @@ namespace ServiceInvoicetoNavius
                 cmd.BindByName = true;
                 cmd.CommandType = CommandType.StoredProcedure;
                 cmd.CommandText = "NUEVO.facturaElecOracle.GuardarFacturas";
-                cmd.CommandTimeout = 0;
-
+                cmd.CommandTimeout = 180; // timeout de cliente; DB puede seguir hasta cancelar
+                cmd.Parameters.Add("p_lote", OracleDbType.Int32, Math.Max(1, pLote), ParameterDirection.Input);
                 cmd.ExecuteNonQuery();
             }
 
@@ -1458,6 +1758,7 @@ namespace ServiceInvoicetoNavius
                 cmdSel.CommandText = @"
                     SELECT CLAVE,
                            REPLACE(DOCUMENTO,'08-','') AS DOCUMENTO,
+                           TIPODOC,
                            NUMEROCONSECUTIVO,
                            ESTADO,
                            MENSAJE_HACIENDA
@@ -1522,6 +1823,12 @@ namespace ServiceInvoicetoNavius
                         ? null
                         : r["MENSAJE_HACIENDA"].ToString();
 
+                // ARREGLO 5: el tipo de documento identifica la fila exacta en ATP
+                string tipoDoc =
+                    r["TIPODOC"] == DBNull.Value
+                        ? null
+                        : r["TIPODOC"].ToString().Trim();
+
                 try
                 {
                     using (var conSrc = OpenSrc())
@@ -1532,21 +1839,30 @@ namespace ServiceInvoicetoNavius
                         // ====================================================
                         // 3. Buscar la fila exacta del documento en ATP
                         // ====================================================
+                        int filasAtp = 0;
+
                         using (var cmdBuscar = conSrc.CreateCommand())
                         {
                             cmdBuscar.BindByName = true;
+                            // ARREGLO 5: número + tipo de documento, sin ROWNUM = 1
                             cmdBuscar.CommandText = @"
                                 SELECT ROWIDTOCHAR(ROWID) AS RID,
                                        CLAVE
                                   FROM VENDOCENCFED
                                  WHERE NUM_FACTURA_ORACLE = :pDOCUMENTO
-                                   AND CIA = :pCIA
-                                   AND ROWNUM = 1";
+                                   AND TRIM(TIPODOC) = :pTIPODOC
+                                   AND CIA = :pCIA";
 
                             cmdBuscar.Parameters.Add(
                                 ":pDOCUMENTO",
                                 OracleDbType.Varchar2,
                                 documento,
+                                ParameterDirection.Input);
+
+                            cmdBuscar.Parameters.Add(
+                                ":pTIPODOC",
+                                OracleDbType.Varchar2,
+                                tipoDoc,
                                 ParameterDirection.Input);
 
                             cmdBuscar.Parameters.Add(
@@ -1557,8 +1873,10 @@ namespace ServiceInvoicetoNavius
 
                             using (var rd = cmdBuscar.ExecuteReader())
                             {
-                                if (rd.Read())
+                                while (rd.Read())
                                 {
+                                    filasAtp++;
+
                                     rowIdDocumento =
                                         rd["RID"] == DBNull.Value
                                             ? null
@@ -1570,6 +1888,20 @@ namespace ServiceInvoicetoNavius
                                             : rd["CLAVE"].ToString().Trim();
                                 }
                             }
+                        }
+
+                        // ARREGLO 5: si hay más de una fila no se adivina cuál es
+                        if (filasAtp > 1)
+                        {
+                            errores++;
+
+                            _log(
+                                $"ATP CON {filasAtp} FILAS PARA EL MISMO DOCUMENTO, NO SE ACTUALIZA | " +
+                                $"Documento={documento} | " +
+                                $"TipoDoc={tipoDoc} | " +
+                                $"Clave={clave}");
+
+                            continue;
                         }
 
                         if (string.IsNullOrWhiteSpace(rowIdDocumento))
@@ -1728,7 +2060,8 @@ namespace ServiceInvoicetoNavius
                                 UPDATE VENDOCENCFED
                                    SET ACT_ORACLE = 'S'
                                  WHERE REPLACE(DOCUMENTO,'08-','') = :pDOCUMENTO
-                                   AND CIA = :pCIA";
+                                   AND TRIM(TIPODOC) = :pTIPODOC
+                                   AND CIA = :pCIA";  // ARREGLO 5
 
                             cmdUpdDst.Parameters.Add(
                                 ":pDOCUMENTO",
@@ -1740,6 +2073,12 @@ namespace ServiceInvoicetoNavius
                                 ":pCIA",
                                 OracleDbType.Varchar2,
                                 _ciaFiltro,
+                                ParameterDirection.Input);
+
+                            cmdUpdDst.Parameters.Add(
+                                ":pTIPODOC",
+                                OracleDbType.Varchar2,
+                                tipoDoc,
                                 ParameterDirection.Input);
 
                             int afectadosDst = cmdUpdDst.ExecuteNonQuery();
@@ -2025,7 +2364,7 @@ namespace ServiceInvoicetoNavius
                 _log("INICIO - Sincronizar facturas aceptadas sin clave");
                 _log("===========================================");
 
-                var facturasPendientes = new List<string>();
+                var facturasPendientes = new List<Tuple<string, string>>();  // ARREGLO 5: número + tipo
 
                 // ============================================================
                 // 1. Buscar en ATP facturas que todavía no tienen CLAVE
@@ -2036,7 +2375,8 @@ namespace ServiceInvoicetoNavius
                     cmd.BindByName = true;
 
                     cmd.CommandText = @"
-                SELECT DISTINCT TRIM(NUM_FACTURA_ORACLE) AS NUM_FACTURA_ORACLE
+                SELECT DISTINCT TRIM(NUM_FACTURA_ORACLE) AS NUM_FACTURA_ORACLE,
+                       TRIM(TIPODOC) AS TIPODOC
                 FROM VENDOCENCFED
                 WHERE CLAVE IS NULL
                   AND TIPODOC <> '08'
@@ -2056,7 +2396,9 @@ namespace ServiceInvoicetoNavius
                                     : rd["NUM_FACTURA_ORACLE"].ToString().Trim();
 
                             if (!string.IsNullOrWhiteSpace(numeroFactura))
-                                facturasPendientes.Add(numeroFactura);
+                                facturasPendientes.Add(Tuple.Create(
+                                    numeroFactura,
+                                    rd["TIPODOC"] == DBNull.Value ? null : rd["TIPODOC"].ToString()));
                         }
                     }
                 }
@@ -2096,8 +2438,9 @@ namespace ServiceInvoicetoNavius
                 FROM VENDOCENCFED
                 WHERE DOCUMENTO = :pNUM_FACTURA_ORACLE
                   AND ESTADO = 'A'
+                  AND TRIM(TIPODOC) = :pTIPODOC
                   AND CIA = :pCIA
-                  AND ROWNUM = 1";
+                  AND ROWNUM = 1";  // ARREGLO 5: filtra por tipo
 
                     var pNumero11g = cmdSel.Parameters.Add(
                         ":pNUM_FACTURA_ORACLE",
@@ -2105,6 +2448,7 @@ namespace ServiceInvoicetoNavius
                     );
 
                     cmdSel.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                    var pTipo11g = cmdSel.Parameters.Add(":pTIPODOC", OracleDbType.Varchar2);
 
                     // ========================================================
                     // UPDATE ATP
@@ -2120,7 +2464,8 @@ namespace ServiceInvoicetoNavius
                  WHERE NUM_FACTURA_ORACLE = :pNUM_FACTURA_ORACLE
                    AND CLAVE IS NULL
                    AND TIPODOC <> '08'
-                   AND CIA = :pCIA";
+                   AND TRIM(TIPODOC) = :pTIPODOC
+                   AND CIA = :pCIA";  // ARREGLO 5: filtra por tipo
 
                     var pNumeroConsecutivo =
                         cmdUpdSrc.Parameters.Add(
@@ -2153,13 +2498,19 @@ namespace ServiceInvoicetoNavius
                         );
 
                     cmdUpdSrc.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                    var pTipoAtp = cmdUpdSrc.Parameters.Add(":pTIPODOC", OracleDbType.Varchar2);
 
                     // ========================================================
                     // Procesar facturas
                     // ========================================================
-                    foreach (string numeroFactura in facturasPendientes)
+                    foreach (var pendiente in facturasPendientes)
                     {
+                        string numeroFactura = pendiente.Item1;
+                        string tipoDoc = pendiente.Item2;
+
                         pNumero11g.Value = numeroFactura;
+                        pTipo11g.Value = tipoDoc;
+                        pTipoAtp.Value = tipoDoc;
 
                         using (var rd = cmdSel.ExecuteReader())
                         {
@@ -2229,7 +2580,30 @@ namespace ServiceInvoicetoNavius
                             pNumeroFactura.Value =
                                 numeroFactura;
 
-                            int afectados = cmdUpdSrc.ExecuteNonQuery();
+                            // ARREGLO 5: se confirma solo si afectó exactamente una fila
+                            int afectados;
+
+                            using (var tx = conSrc.BeginTransaction())
+                            {
+                                afectados = cmdUpdSrc.ExecuteNonQuery();
+
+                                if (afectados == 1)
+                                {
+                                    tx.Commit();
+                                }
+                                else
+                                {
+                                    tx.Rollback();
+
+                                    _log(
+                                        $"ATP NO ACTUALIZADO (afectaría {afectados} filas) | " +
+                                        $"NUM_FACTURA_ORACLE={numeroFactura} | " +
+                                        $"TIPODOC={tipoDoc} | " +
+                                        $"CLAVE={clave}");
+
+                                    continue;
+                                }
+                            }
 
                             totalActualizadas += afectados;
 
