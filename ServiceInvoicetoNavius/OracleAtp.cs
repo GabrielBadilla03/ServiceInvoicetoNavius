@@ -1,4 +1,4 @@
-﻿using Oracle.ManagedDataAccess.Client;
+using Oracle.ManagedDataAccess.Client;
 using Oracle.ManagedDataAccess;
 using System;
 using System.Collections.Concurrent;
@@ -1212,6 +1212,21 @@ namespace ServiceInvoicetoNavius
                 WHERE NVL(INDTRASLADO,'N') = 'N'
                   AND TIPODOC IS NOT NULL
                   AND CIA = :pCIA
+                  AND NUM_FACTURA_ORACLE IN (
+                      SELECT num FROM (
+                          SELECT num, ROW_NUMBER() OVER (ORDER BY ruta, num) AS rn
+                          FROM (
+                              SELECT TRIM(NUM_FACTURA_ORACLE) AS num, MIN(COD_RUTA) AS ruta
+                              FROM VENDOCENCFED
+                              WHERE NVL(INDTRASLADO,'N') = 'N'
+                                AND CIA = :pCIA
+                                AND TIPODOC IS NOT NULL
+                                AND NUM_FACTURA_ORACLE IS NOT NULL
+                              GROUP BY TRIM(NUM_FACTURA_ORACLE)
+                              HAVING COUNT(*) = 1
+                          )
+                      ) WHERE rn <= :pMax
+                  )
                 ORDER BY COD_RUTA ASC";
 
             var dt = new DataTable();
@@ -1223,6 +1238,7 @@ namespace ServiceInvoicetoNavius
                 cmd.InitialLOBFetchSize = -1;
                 cmd.CommandText = selectBase;
                 cmd.Parameters.Add(":pCIA", OracleDbType.Varchar2, _ciaFiltro, ParameterDirection.Input);
+                cmd.Parameters.Add(":pMax", OracleDbType.Int32, Math.Max(1, Math.Min(500, _opciones.MaxFacturasPorCiclo <= 0 ? 10 : _opciones.MaxFacturasPorCiclo)), ParameterDirection.Input);
 
                 using (var da = new OracleDataAdapter(cmd))
                     da.Fill(dt);
@@ -1332,7 +1348,7 @@ namespace ServiceInvoicetoNavius
             {
                 string err = $"NUM_FACTURA_ORACLE repetido en ATP ({g.Filas.Count} encabezados pendientes). Revisar manualmente.";
                 _log($"OMITIDA | {ctx} | {err}");
-                MarcarFacturaConError(factura, err);
+                _log($"REQUIERE REVISION SIN MODIFICAR ATP | {ctx} | {err}");
                 return ResultadoTraslado.Error;
             }
 
@@ -1364,7 +1380,7 @@ namespace ServiceInvoicetoNavius
                         : $"NUM_FACTURA_ORACLE ya existe en XXORA_VENDOCENCFED (ID_FACTURA_ORACLE destino={idEnDestino}). Documento repetido.";
 
                     _log($"ERROR | {ctx} | {err}");
-                    MarcarFacturaConError(factura, err);
+                    _log($"REQUIERE REVISION SIN MODIFICAR ATP | {ctx} | {err}");
                     return ResultadoTraslado.Error;
                 }
             }
@@ -1464,7 +1480,7 @@ namespace ServiceInvoicetoNavius
 
                     string err = $"Traslado revertido (rollback) | {ex.Message}";
                     _log($"ERROR | {ctx} | {err}");
-                    MarcarFacturaConError(factura, err);
+                    _log($"ERROR TRANSITORIO SIN MARCAR ATP E | {ctx} | {err}");
                     return ResultadoTraslado.Error;
                 }
             }
@@ -1475,8 +1491,7 @@ namespace ServiceInvoicetoNavius
             _log($"Trasladada OK | {ctx} | LineasDetalle={dtDet.Rows.Count} | LineasImpuesto={dtImp.Rows.Count}");
 
             // Si este UPDATE falla, el siguiente ciclo la detecta como "YA TRASLADADA".
-            MarcarTrasladada(numFacturaOracle);
-            return ResultadoTraslado.Ok;
+            return MarcarTrasladada(numFacturaOracle) ? ResultadoTraslado.Ok : ResultadoTraslado.Pendiente;
         }
 
         private ResultadoTraslado EsperarOMarcarError(FacturaInfo factura, string motivo, string ctx)
@@ -1489,13 +1504,10 @@ namespace ServiceInvoicetoNavius
                 return ResultadoTraslado.Pendiente;
             }
 
-            int ignorado;
-            _ciclosEspera.TryRemove(factura.NumFacturaOracle, out ignorado);
-
-            string err = $"{motivo}. Sin cambios después de {ciclos} ciclos.";
-            _log($"ERROR | {ctx} | {err}");
-            MarcarFacturaConError(factura, err);
-            return ResultadoTraslado.Error;
+            // El origen puede tardar más que MaxCiclosEspera; nunca bloquearlo permanentemente.
+            // Sin una tabla persistente de reintentos, mantener N y registrar el diagnóstico.
+            _log($"PENDIENTE PROLONGADO ({ciclos} ciclos) | {ctx} | {motivo}");
+            return ResultadoTraslado.Pendiente;
         }
 
         private DataTable LeerAtp(string sql, string numFacturaOracle, string tipoDoc)
@@ -1576,7 +1588,7 @@ namespace ServiceInvoicetoNavius
             }
         }
 
-        private void MarcarTrasladada(string numFacturaOracle)
+        private bool MarcarTrasladada(string numFacturaOracle)
         {
             try
             {
@@ -1607,7 +1619,7 @@ namespace ServiceInvoicetoNavius
                             {
                                 tx.Rollback();
                                 _log($"NO MARCADA EN ATP | FacturaOracle={numFacturaOracle} | Coincidencias pendientes={candidatas} (se requiere identidad unica)");
-                                return;
+                                return false;
                             }
                         }
                         int actualizadas = cmd.ExecuteNonQuery();
@@ -1615,15 +1627,17 @@ namespace ServiceInvoicetoNavius
                         {
                             tx.Rollback();
                             _log($"NO MARCADA EN ATP | FacturaOracle={numFacturaOracle} | Filas afectadas={actualizadas}");
-                            return;
+                            return false;
                         }
                         tx.Commit();
                     }
+                    return true;
                 }
             }
             catch (Exception ex)
             {
-                _log($"ERROR marcando INDTRASLADO='S' | FacturaOracle={numFacturaOracle} | {ex.Message} (se corrige en el siguiente ciclo)");
+                _log($"ERROR marcando INDTRASLADO='S' | FacturaOracle={numFacturaOracle} | {ex.Message} (requiere conciliación)");
+                return false;
             }
         }
 
@@ -1724,8 +1738,10 @@ namespace ServiceInvoicetoNavius
         {
             if (v == null || v == DBNull.Value) return 0m;
             decimal d;
-            return decimal.TryParse(Convert.ToString(v, CultureInfo.InvariantCulture),
-                                    NumberStyles.Any, CultureInfo.InvariantCulture, out d) ? d : 0m;
+            if (!decimal.TryParse(Convert.ToString(v, CultureInfo.InvariantCulture),
+                                  NumberStyles.Any, CultureInfo.InvariantCulture, out d))
+                throw new FormatException("Valor monetario no numérico; se detiene traslado para evitar datos inválidos.");
+            return d;
         }
 
         public void EjecutarGuardarFacturas(int pLote)
